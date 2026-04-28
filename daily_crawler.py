@@ -11,6 +11,39 @@ QUERY = "Lập trình viên"
 LOCATION = "Thành phố Hồ Chí Minh"
 card_selector = "div.job_seen_beacon"   
 
+money_patterns = [
+    # 1. Range: 10 - 20 triệu, 2500k–3000k
+    r"(\d+[\d.,]*\s*(?:-|–|to)\s*\d+[\d.,]*\s*(?:k|triệu|tr|vnđ|vnd|usd|\$))",
+    # 2. From / Up to
+    r"(?:from|từ)\s*\d+[\d.,]*\s*(?:k|triệu|tr|vnđ|vnd|usd|\$)",
+    r"(?:up to|đến)\s*\d+[\d.,]*\s*(?:k|triệu|tr|vnđ|vnd|usd|\$)",
+
+    # 3. Single value
+    r"(\d+[\d.,]*\s*(?:k|triệu|tr|vnđ|vnd|usd|\$))",
+
+    # 4. Có chữ “lương”
+    r"(lương[:\s]*\d+[\d.,]*.*?(?:k|triệu|tr|vnđ|vnd|usd|\$))",
+
+    # 5. Có /tháng /month /year
+    r"(\d+[\d.,]*\s*(?:k|triệu|tr|usd|\$)\s*/\s*(?:tháng|month|năm|year))",
+    
+    # 6. Có chữ “khoảng”
+    r"(khoảng\s*\d+[\d.,]*\s*(?:k|triệu|tr|vnđ|vnd|usd|\$))",
+]
+
+def extract_salary(text):
+    if not text or text == "N/A":
+        return "N/A"
+    
+    text = text.lower().strip()
+    
+    for pattern in money_patterns:
+        match = re.search(pattern, text)
+        if match:
+            return clean_salary_text(match.group(0))
+    
+    return "N/A"
+
 def clean_salary_text(text):
     if not text or text == "N/A":
         return "N/A"
@@ -46,6 +79,13 @@ class Crawler:
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
         )
         self.page = self.context.new_page()
+        def block_resources(route):
+            if route.request.resource_type in ["image", "font", "media"]:
+                route.abort()
+            else:
+                route.continue_()
+
+        self.context.route("**/*", block_resources)
     def get_existing_job_keys(self):
         try:
             params = {"sheetName": self.query}
@@ -60,44 +100,6 @@ class Crawler:
         except Exception as e:
             print(f"Error fetching existing job keys: {e}")
             return set()
-    
-    def fetch_job_detail(self, browser_context, job_key):
-        detail_url = f"https://vn.indeed.com/viewjob?jk={job_key}"
-        detail_page = None
-        try:
-            detail_page = browser_context.new_page()
-            detail_page.goto(detail_url, wait_until="networkidle", timeout=45000)
-            time.sleep(random.uniform(3, 7))  # Random sleep to mimic human behavior
-            
-            description_selector = detail_page.query_selector("#jobDescriptionText")
-            if description_selector is None:
-                return "N/A", "Unknown"
-            
-            description_text = description_selector.inner_text().lower()
-            full_html = detail_page.content().lower()
-            salary = "N/A"
-            
-            money_regex = r"(\d+[\d.,]*\s*(?:K|k|triệu|tr|vnđ|vnd|usd|\$))"
-            
-            match = re.search(money_regex, description_text)
-            if match:
-                salary = clean_salary_text(match.group(0))
-            elif "thỏa thuận" in description_text:
-                salary = "Thỏa thuận"
-                
-            # Lấy Apply Method
-            apply_method = "Apply on Company Site"
-            if "indeedapplybutton" in full_html or "nộp đơn ngay" in description_text or "apply now" in description_text:
-                apply_method = "Apply Now with Indeed"
-                
-            return salary, apply_method
-        except Exception as e:
-            print(f"Error fetching job details from {detail_url}: {e}")
-            return "N/A", "Unknown"
-        finally:
-            if detail_page:
-                detail_page.close() # Đóng trang chi tiết sau khi lấy xong để tiết kiệm tài nguyên
-
     def crawl(self):
         for p in range(self.pages):
             start = p * 10
@@ -106,58 +108,84 @@ class Crawler:
             
             try:
                 self.page.goto(indeed_url, wait_until="domcontentloaded", timeout=90000)
-                self.page.wait_for_timeout(3000)  # Wait for 5 seconds to ensure the page is fully loaded
+                self.page.wait_for_timeout(3000)  # Wait for 3 seconds to ensure the page is fully loaded
                 
                 cards = self.page.query_selector_all(card_selector)
                 
                 for card in cards:
-                    #  Scroll to the card to ensure it's in view
-                    card.scroll_into_view_if_needed()
-                    
                     title_link = card.query_selector("h2.jobTitle a")
                     
-                    # Extract jk as job key in URL query parameter
-                    if title_link:
-                        job_key = title_link.get_attribute("data-jk")
+                    if not title_link:
+                        continue
+                    
+                    # Click on the title link for the right card to load the job detail in the side panel
+                    
+                    job_key = title_link.get_attribute("data-jk")
+                    
+                    if job_key in self.seen_ids:
+                        continue
+                    
+                     # Tạm thời chặn tất cả các request để tránh bị timeout khi mở trang chi tiết
+                    
+                    job_title = title_link.inner_text().strip()
+                    
+                    job_company = card.query_selector("[data-testid='company-name']").inner_text().strip() if card.query_selector("[data-testid='company-name']") else "N/A"
+                    job_location = card.query_selector("[data-testid='text-location']").inner_text().strip() if card.query_selector("[data-testid='text-location']") else "N/A"
+                    
+                    job_link = f"https://vn.indeed.com/viewjob?jk={job_key}" if job_key else "N/A"
+                    easily_apply = "Yes" if (
+                        card.locator("[data-testid='indeedApply']").count() > 0 or
+                        card.locator("text=Dễ dàng nộp đơn").count() > 0
+                    ) else "No"
+                    time.sleep(random.uniform(1, 5))  # Random sleep to mimic human behavior
+                    
+                    salary = "N/A"
+                    apply_method = "Unknown"
+                    
+                    salary_on_card = card.query_selector("[data-testid*='salary-snippet']").inner_text().strip() if card.query_selector("[data-testid*='salary-snippet']") else "N/A"
+                    
+                    if salary_on_card != "N/A":
+                        salary = clean_salary_text(salary_on_card)
+                    else:
+                        title_link.scroll_into_view_if_needed()
+                        title_link.click()
+                        self.page.wait_for_timeout(300)  # Wait for 2 seconds to allow the side panel to load
                         
-                        if job_key in self.seen_ids:
-                            continue
-                        
-                        job_title = title_link.inner_text().strip()
-                        
-                        job_company = card.query_selector("[data-testid='company-name']").inner_text().strip() if card.query_selector("[data-testid='company-name']") else "N/A"
-                        job_location = card.query_selector("[data-testid='text-location']").inner_text().strip() if card.query_selector("[data-testid='text-location']") else "N/A"
-                        
-                        job_link = f"https://vn.indeed.com/viewjob?jk={job_key}" if job_key else "N/A"
-                        easily_apply = "Yes" if (card.query_selector("[data-testid='indeedApply']") or "nộp đơn" in card.inner_text().lower() or "apply" in card.inner_text().lower()) else "No"
-                        time.sleep(random.uniform(1, 5))  # Random sleep to mimic human behavior
-                        
-                        salary = "N/A"
-                        apply_method = "Unknown"
-                        
-                        salary_on_card = card.query_selector("[data-testid*='salary-snippet']").inner_text().strip() if card.query_selector("[data-testid*='salary-snippet']") else "N/A"
-                        
-                        if salary_on_card != "N/A":
-                            salary = clean_salary_text(salary_on_card)
-                        else:
-                            salary, apply_method = self.fetch_job_detail(self.context, job_key)
+                        self.page.locator("#jobDescriptionText").first.wait_for()
+
+                        try:
+                            apply_btn = self.page.locator("#applyButtonLinkContainer button")
+                            apply_btn.wait_for(timeout=5000)
                             
-                        job_data = {
-                            "key": job_key,
-                            "title": job_title,
-                            "company": job_company,
-                            "location": job_location,
-                            "salary": salary,
-                            "link": job_link,
-                            "page": p + 1,
-                            "easily_apply": easily_apply,
-                            "apply_method": apply_method
-                        }
+                            apply_text = apply_btn.inner_text().lower()
+                            
+                            if "indeed" in apply_text:
+                                apply_method = "Apply Now with Indeed"
+                            else:
+                                apply_method = "Apply on Company Site"
+                        except:
+                            apply_method = "Unknown"
                         
-                        self.data.append(job_data)
-                        self.seen_ids.add(job_key)
-                        print(f"✅ Found: {job_title} at {job_company} - {salary} - Apply Method: {apply_method}")
-                time.sleep(random.uniform(10, 40))  # Random sleep between page navigations
+                        desc_el = self.page.query_selector("#jobDescriptionText")
+                        description = desc_el.inner_text().strip() if desc_el else ""
+                        salary = extract_salary(description)
+                        
+                    job_data = {
+                        "key": job_key,
+                        "title": job_title,
+                        "company": job_company,
+                        "location": job_location,
+                        "salary": salary,
+                        "link": job_link,
+                        "page": p + 1,
+                        "easily_apply": easily_apply,
+                        "apply_method": apply_method
+                    }
+                    
+                    self.data.append(job_data)
+                    self.seen_ids.add(job_key)
+                    print(f"✅ Found: {job_title} at {job_company} - {salary} - Apply Method: {apply_method}")
+                time.sleep(random.uniform(2, 5))  # Random sleep between page navigations
                         
             except Exception as e:
                 print(f"Error navigating to {indeed_url}: {e}")
